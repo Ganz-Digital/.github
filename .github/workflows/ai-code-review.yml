@@ -55,7 +55,21 @@ jobs:
           set -e
           [ -s pr.diff ] || { echo "Empty diff, skipping"; exit 0; }
 
+          MARKER="<!-- ai-consistency-review -->"
+
+          # Find the most recent review comment so its findings can be re-checked
+          gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" --paginate \
+            --jq ".[] | select(.body | startswith(\"$MARKER\")) | {node_id, body}" | jq -s '.' > previous.json || echo '[]' > previous.json
+          jq -r 'last.body // empty' previous.json > previous.raw || true
+          # Drop the marker and cost footer, keep the findings
+          grep -v -e "^$MARKER" -e '^<sub>💰' previous.raw > previous.md || true
+
           PROMPT="Do a consistency check of this PR. Does it introduce code duplication? Does it use different names for the same things? Is it as simple as possible and reasonable? Does it create unnecessary boilerplate? Ignore translations."
+          if [ -s previous.md ]; then
+            PROMPT="$PROMPT
+
+          A previous AI review of an earlier version of this PR is included below. Start your answer with a section \"Previous findings\" that lists each of its findings as ✅ addressed or ❌ still open, judged against the current diff. Then report only new issues under \"New findings\"."
+          fi
 
           jq -n \
             --arg model "$MODEL" \
@@ -64,13 +78,18 @@ jobs:
             --arg title "$PR_TITLE" \
             --arg body "$PR_BODY" \
             --rawfile diff pr.diff \
+            --rawfile previous previous.md \
             '{
               model: $model,
               # Only route to providers that neither train on nor retain prompts
               provider: {data_collection: "deny", zdr: true},
+              # Return token counts and cost in the response
+              usage: {include: true},
               messages: [
                 {role: "system", content: "You are a senior code reviewer. Answer concisely in Markdown. Reference files and lines from the diff. If there are no issues for a question, say so in one line."},
-                {role: "user", content: ($prompt + "\n\nPR title: " + $title + "\n\nPR description:\n" + $body + "\n\nDiff:\n```diff\n" + $diff + "\n```")}
+                {role: "user", content: ($prompt + "\n\nPR title: " + $title + "\n\nPR description:\n" + $body
+                  + (if $previous != "" then "\n\nPrevious review:\n" + $previous else "" end)
+                  + "\n\nDiff:\n```diff\n" + $diff + "\n```")}
               ]
             }
             + if $model == "openrouter/pareto-code"
@@ -87,17 +106,21 @@ jobs:
           # Routers resolve to a concrete model; show which one actually reviewed
           USED_MODEL=$(jq -r '.model // empty' response.json)
 
-          MARKER="<!-- ai-consistency-review -->"
-          printf '%s\n### 🤖 AI consistency review (`%s`)\n\n%s\n' "$MARKER" "${USED_MODEL:-$MODEL}" "$REVIEW" > comment.md
+          # OpenRouter reports the cost in USD (credits)
+          COST=$(jq -r '.usage | if .cost != null then "$\(.cost * 10000 | round / 10000) · \(.prompt_tokens) prompt + \(.completion_tokens) completion tokens" else "n/a" end' response.json 2>/dev/null || echo "n/a")
 
-          # Update the previous review comment instead of adding a new one on every push
-          COMMENT_ID=$(gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" --paginate \
-            --jq ".[] | select(.body | startswith(\"$MARKER\")) | .id" | head -n1)
-          if [ -n "$COMMENT_ID" ]; then
-            gh api -X PATCH "repos/${{ github.repository }}/issues/comments/$COMMENT_ID" -F body=@comment.md > /dev/null
-          else
-            gh pr comment "${{ github.event.pull_request.number }}" --body-file comment.md
-          fi
+          printf '%s\n### 🤖 AI consistency review (`%s`)\n\n%s\n\n<sub>💰 Review cost: %s</sub>\n' \
+            "$MARKER" "${USED_MODEL:-$MODEL}" "$REVIEW" "$COST" > comment.md
+
+          # Post a new comment per review so the history and each run's cost stay visible
+          gh pr comment "${{ github.event.pull_request.number }}" --body-file comment.md
+
+          # Collapse earlier reviews as outdated; they stay readable but don't clutter the thread
+          for NODE_ID in $(jq -r '.[].node_id' previous.json 2>/dev/null); do
+            gh api graphql -f id="$NODE_ID" \
+              -f query='mutation($id: ID!) { minimizeComment(input: {subjectId: $id, classifier: OUTDATED}) { clientMutationId } }' \
+              > /dev/null || echo "::warning::Could not hide previous review comment $NODE_ID"
+          done
 
       - name: Report skipped review
         if: steps.checkout.outcome == 'failure' || steps.diff.outcome == 'failure' || steps.review.outcome == 'failure'
