@@ -1,0 +1,104 @@
+name: AI consistency review
+"on":
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    # Secrets are not available to fork PRs; skip drafts to save tokens
+    if: "${{ github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft }}"
+    runs-on: ubuntu-latest
+    env:
+      # pareto-code picks the cheapest available coding model above MIN_CODING_SCORE (0-1)
+      MODEL: "openrouter/pareto-code"
+      MIN_CODING_SCORE: "0.4"
+      MAX_DIFF_CHARS: 200000
+      GH_TOKEN: ${{ github.token }}
+    # The review is advisory: steps may fail, but the job always succeeds so it never blocks a merge
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Collect diff
+        id: diff
+        continue-on-error: true
+        run: |
+          set -e
+          git diff "origin/${{ github.base_ref }}...HEAD" -- . \
+            ':!package-lock.json' ':!yarn.lock' ':!pnpm-lock.yaml' ':!*.snap' ':!**/dist/**' \
+            > pr.diff
+          if [ "$(wc -c < pr.diff)" -gt "$MAX_DIFF_CHARS" ]; then
+            head -c "$MAX_DIFF_CHARS" pr.diff > pr.trimmed && mv pr.trimmed pr.diff
+            printf '\n\n[diff truncated]\n' >> pr.diff
+          fi
+
+      - name: Run review
+        id: review
+        continue-on-error: true
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -e
+          [ -s pr.diff ] || { echo "Empty diff, skipping"; exit 0; }
+
+          PROMPT="Do a consistency check of this PR. Does it introduce code duplication? Does it use different names for the same things? Is it as simple as possible and reasonable? Does it create unnecessary boilerplate? Ignore translations."
+
+          jq -n \
+            --arg model "$MODEL" \
+            --argjson minCodingScore "$MIN_CODING_SCORE" \
+            --arg prompt "$PROMPT" \
+            --arg title "$PR_TITLE" \
+            --arg body "$PR_BODY" \
+            --rawfile diff pr.diff \
+            '{
+              model: $model,
+              # Only route to providers that neither train on nor retain prompts
+              provider: {data_collection: "deny", zdr: true},
+              messages: [
+                {role: "system", content: "You are a senior code reviewer. Answer concisely in Markdown. Reference files and lines from the diff. If there are no issues for a question, say so in one line."},
+                {role: "user", content: ($prompt + "\n\nPR title: " + $title + "\n\nPR description:\n" + $body + "\n\nDiff:\n```diff\n" + $diff + "\n```")}
+              ]
+            }
+            + if $model == "openrouter/pareto-code"
+              then {plugins: [{id: "pareto-router", min_coding_score: $minCodingScore}]}
+              else {} end' > request.json
+
+          curl -sS --fail-with-body https://openrouter.ai/api/v1/chat/completions \
+            -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d @request.json > response.json
+
+          REVIEW=$(jq -r '.choices[0].message.content // empty' response.json)
+          [ -n "$REVIEW" ] || { echo "No review returned:"; cat response.json; exit 1; }
+          # Routers resolve to a concrete model; show which one actually reviewed
+          USED_MODEL=$(jq -r '.model // empty' response.json)
+
+          MARKER="<!-- ai-consistency-review -->"
+          printf '%s\n### 🤖 AI consistency review (`%s`)\n\n%s\n' "$MARKER" "${USED_MODEL:-$MODEL}" "$REVIEW" > comment.md
+
+          # Update the previous review comment instead of adding a new one on every push
+          COMMENT_ID=$(gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" --paginate \
+            --jq ".[] | select(.body | startswith(\"$MARKER\")) | .id" | head -n1)
+          if [ -n "$COMMENT_ID" ]; then
+            gh api -X PATCH "repos/${{ github.repository }}/issues/comments/$COMMENT_ID" -F body=@comment.md > /dev/null
+          else
+            gh pr comment "${{ github.event.pull_request.number }}" --body-file comment.md
+          fi
+
+      - name: Report skipped review
+        if: steps.checkout.outcome == 'failure' || steps.diff.outcome == 'failure' || steps.review.outcome == 'failure'
+        run: echo "::warning::AI review could not be completed, see the step logs above"
