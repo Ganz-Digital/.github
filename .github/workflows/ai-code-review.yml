@@ -1,27 +1,35 @@
 name: AI consistency review
 "on":
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, review_requested]
 
 permissions:
   contents: read
   pull-requests: write
 
-concurrency:
-  group: ai-review-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+env:
+  GH_TOKEN: ${{ github.token }}
+  PR_NUMBER: ${{ github.event.pull_request.number }}
+  # Reviews are tied to the commit they reviewed, so stale reviews are never used for reminders
+  HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+  REVIEW_MARKER: "<!-- ai-consistency-review"
+  REMINDER_MARKER: "<!-- ai-review-reminder"
 
 jobs:
   review:
-    # Secrets are not available to fork PRs; skip drafts to save tokens
-    if: "${{ github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft }}"
+    # Secrets are not available to fork PRs; skip drafts to save tokens.
+    # A review request doesn't change the code, so it doesn't need a new review.
+    if: "${{ github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft && github.event.action != 'review_requested' }}"
     runs-on: ubuntu-latest
+    # A new push makes a running review stale
+    concurrency:
+      group: ai-review-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     env:
       # pareto-code picks the cheapest available coding model above MIN_CODING_SCORE (0-1)
       MODEL: "openrouter/pareto-code"
       MIN_CODING_SCORE: "0.4"
       MAX_DIFF_CHARS: 200000
-      GH_TOKEN: ${{ github.token }}
     # The review is advisory: steps may fail, but the job always succeeds so it never blocks a merge
     steps:
       - name: Checkout code
@@ -55,21 +63,23 @@ jobs:
           set -e
           [ -s pr.diff ] || { echo "Empty diff, skipping"; exit 0; }
 
-          MARKER="<!-- ai-consistency-review -->"
-
           # Find the most recent review comment so its findings can be re-checked
-          gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" --paginate \
-            --jq ".[] | select(.body | startswith(\"$MARKER\")) | {node_id, body}" | jq -s '.' > previous.json || echo '[]' > previous.json
+          gh api "repos/${{ github.repository }}/issues/$PR_NUMBER/comments" --paginate \
+            --jq ".[] | select(.body | startswith(\"$REVIEW_MARKER\")) | {node_id, body}" | jq -s '.' > previous.json || echo '[]' > previous.json
           jq -r 'last.body // empty' previous.json > previous.raw || true
           # Drop the marker and cost footer, keep the findings
-          grep -v -e "^$MARKER" -e '^<sub>💰' previous.raw > previous.md || true
+          grep -v -e "^$REVIEW_MARKER" -e '^<sub>💰' previous.raw > previous.md || true
 
           PROMPT="Do a consistency check of this PR. Does it introduce code duplication? Does it use different names for the same things? Is it as simple as possible and reasonable? Does it create unnecessary boilerplate? Ignore translations."
           if [ -s previous.md ]; then
             PROMPT="$PROMPT
 
-          A previous AI review of an earlier version of this PR is included below. Start your answer with a section \"Previous findings\" that lists each of its findings as ✅ addressed or ❌ still open, judged against the current diff. Then report only new issues under \"New findings\"."
+          A previous AI review of an earlier version of this PR is included below. Start your answer with a section \"Previous findings\" that lists each of its findings as addressed or still open, judged against the current diff. Then report only new issues under \"New findings\"."
           fi
+          # The reminder job extracts open findings by this format, so it must be strict
+          PROMPT="$PROMPT
+
+          Format every finding as a single Markdown bullet line with its file and line: start open findings (including all new findings) with \"- ❌ \" and addressed previous findings with \"- ✅ \". Use ❌ and ✅ nowhere else."
 
           jq -n \
             --arg model "$MODEL" \
@@ -109,11 +119,11 @@ jobs:
           # OpenRouter reports the cost in USD (credits)
           COST=$(jq -r '.usage | if .cost != null then "$\(.cost * 10000 | round / 10000) · \(.prompt_tokens) prompt + \(.completion_tokens) completion tokens" else "n/a" end' response.json 2>/dev/null || echo "n/a")
 
-          printf '%s\n### 🤖 AI consistency review (`%s`)\n\n%s\n\n<sub>💰 Review cost: %s</sub>\n' \
-            "$MARKER" "${USED_MODEL:-$MODEL}" "$REVIEW" "$COST" > comment.md
+          printf '%s sha=%s -->\n### 🤖 AI consistency review (`%s`)\n\n%s\n\n<sub>💰 Review cost: %s</sub>\n' \
+            "$REVIEW_MARKER" "$HEAD_SHA" "${USED_MODEL:-$MODEL}" "$REVIEW" "$COST" > comment.md
 
           # Post a new comment per review so the history and each run's cost stay visible
-          gh pr comment "${{ github.event.pull_request.number }}" --body-file comment.md
+          gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" --body-file comment.md
 
           # Collapse earlier reviews as outdated; they stay readable but don't clutter the thread
           for NODE_ID in $(jq -r '.[].node_id' previous.json 2>/dev/null); do
@@ -125,3 +135,53 @@ jobs:
       - name: Report skipped review
         if: steps.checkout.outcome == 'failure' || steps.diff.outcome == 'failure' || steps.review.outcome == 'failure'
         run: echo "::warning::AI review could not be completed, see the step logs above"
+
+  remind:
+    # Runs after each review and on review requests (when the review job is skipped).
+    # No model involved: open findings are extracted from the latest review.
+    needs: review
+    if: "${{ always() && needs.review.result != 'cancelled' && github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft }}"
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ai-review-reminder-${{ github.event.pull_request.number }}
+    env:
+      PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+    steps:
+      - name: Ask author about open findings
+        continue-on-error: true
+        run: |
+          set -e
+          REPO="${{ github.repository }}"
+
+          # Use live PR state: the event payload may be outdated by the time this runs
+          gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid,reviewRequests > pr.json
+          [ "$(jq -r '.headRefOid' pr.json)" = "$HEAD_SHA" ] || { echo "PR has newer commits, skipping"; exit 0; }
+          [ "$(jq '.reviewRequests | length' pr.json)" -gt 0 ] || { echo "No review requested, skipping"; exit 0; }
+
+          gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
+            --jq ".[] | select(.body | startswith(\"$REVIEW_MARKER\") or startswith(\"$REMINDER_MARKER\")) | {node_id, body}" \
+            | jq -s '.' > comments.json
+
+          # The review for this commit may still be running; its own remind job will follow up
+          jq -r --arg m "$REVIEW_MARKER sha=$HEAD_SHA " \
+            '[.[] | select(.body | startswith($m))] | last.body // empty' comments.json > review.md
+          [ -s review.md ] || { echo "No AI review for $HEAD_SHA yet, skipping"; exit 0; }
+
+          # review_requested fires once per reviewer; remind at most once per commit
+          if jq -e --arg m "$REMINDER_MARKER sha=$HEAD_SHA " 'any(.[]; .body | startswith($m))' comments.json > /dev/null; then
+            echo "Already reminded for $HEAD_SHA, skipping"; exit 0
+          fi
+
+          # Reminders for older commits are outdated either way
+          for NODE_ID in $(jq -r --arg m "$REMINDER_MARKER" '.[] | select(.body | startswith($m)) | .node_id' comments.json); do
+            gh api graphql -f id="$NODE_ID" \
+              -f query='mutation($id: ID!) { minimizeComment(input: {subjectId: $id, classifier: OUTDATED}) { clientMutationId } }' \
+              > /dev/null || echo "::warning::Could not hide previous reminder $NODE_ID"
+          done
+
+          OPEN=$(grep '^- ❌' review.md || true)
+          [ -n "$OPEN" ] || { echo "No open findings"; exit 0; }
+
+          printf '%s sha=%s -->\n@%s A review was requested, but these AI review findings are still open. Please fix them or reply with your reasoning, so the reviewers have context:\n\n%s\n' \
+            "$REMINDER_MARKER" "$HEAD_SHA" "$PR_AUTHOR" "$OPEN" > reminder.md
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file reminder.md
