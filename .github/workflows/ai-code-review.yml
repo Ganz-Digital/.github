@@ -16,24 +16,30 @@ env:
   REMINDER_MARKER: "<!-- ai-review-reminder"
 
 jobs:
+  # A single job, because Actions bills each job rounded up to the full minute
   review:
-    # Secrets are not available to fork PRs; skip drafts to save tokens.
-    # A review request doesn't change the code, so it doesn't need a new review.
-    if: "${{ github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft && github.event.action != 'review_requested' }}"
-    runs-on: ubuntu-latest
-    # A new push makes a running review stale
+    # Secrets are not available to fork PRs; skip drafts to save tokens
+    if: "${{ github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft }}"
+    # Only shell tools are needed, so the cheapest runner is enough
+    runs-on: ubuntu-slim
+    # Backstop for hung steps; the model request has its own, shorter timeout
+    timeout-minutes: 8
+    # A new push makes a running review stale. Review requests get their own group,
+    # so they never cancel a running review.
     concurrency:
-      group: ai-review-${{ github.event.pull_request.number }}
-      cancel-in-progress: true
+      group: ai-review-${{ github.event.pull_request.number }}-${{ github.event.action == 'review_requested' && 'remind' || 'review' }}
+      cancel-in-progress: ${{ github.event.action != 'review_requested' }}
     env:
       # pareto-code picks the cheapest available coding model above MIN_CODING_SCORE (0-1)
       MODEL: "openrouter/pareto-code"
       MIN_CODING_SCORE: "0.4"
       MAX_DIFF_CHARS: 200000
-    # The review is advisory: steps may fail, but the job always succeeds so it never blocks a merge
+    # The review is advisory: steps may fail, but the job always succeeds so it never blocks a merge.
+    # A review request doesn't change the code, so it only runs the reminder.
     steps:
       - name: Checkout code
         id: checkout
+        if: github.event.action != 'review_requested'
         continue-on-error: true
         uses: actions/checkout@v4
         with:
@@ -41,6 +47,7 @@ jobs:
 
       - name: Collect diff
         id: diff
+        if: github.event.action != 'review_requested'
         continue-on-error: true
         run: |
           set -e
@@ -54,6 +61,7 @@ jobs:
 
       - name: Run review
         id: review
+        if: github.event.action != 'review_requested'
         continue-on-error: true
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
@@ -65,7 +73,19 @@ jobs:
 
           # Find the most recent review comment so its findings can be re-checked
           gh api "repos/${{ github.repository }}/issues/$PR_NUMBER/comments" --paginate \
-            --jq ".[] | select(.body | startswith(\"$REVIEW_MARKER\")) | {node_id, body}" | jq -s '.' > previous.json || echo '[]' > previous.json
+            --jq ".[] | select(.body | startswith(\"$REVIEW_MARKER\")) | {id, node_id, body}" | jq -s '.' > previous.json || echo '[]' > previous.json
+
+          # Rebases and base merges often leave the diff unchanged. Then the latest review still
+          # applies: move it to this commit instead of paying for the same review again.
+          DIFF_HASH=$(sha256sum pr.diff | cut -c1-16)
+          if [ "$(jq -r 'last.body // "" | capture("diff=(?<h>[0-9a-f]+)").h' previous.json)" = "$DIFF_HASH" ]; then
+            jq -r --arg m "$REVIEW_MARKER sha=$HEAD_SHA diff=$DIFF_HASH -->" 'last.body | sub("^[^\n]*"; $m)' previous.json > comment.md
+            gh api -X PATCH "repos/${{ github.repository }}/issues/comments/$(jq -r 'last.id' previous.json)" \
+              -F body=@comment.md > /dev/null
+            echo "Diff unchanged since the last review, reused it for $HEAD_SHA"
+            exit 0
+          fi
+
           jq -r 'last.body // empty' previous.json > previous.raw || true
           # Drop the marker and cost footer, keep the findings
           grep -v -e "^$REVIEW_MARKER" -e '^<sub>💰' previous.raw > previous.md || true
@@ -106,7 +126,7 @@ jobs:
               then {plugins: [{id: "pareto-router", min_coding_score: $minCodingScore}]}
               else {} end' > request.json
 
-          curl -sS --fail-with-body https://openrouter.ai/api/v1/chat/completions \
+          curl -sS --fail-with-body --max-time 300 https://openrouter.ai/api/v1/chat/completions \
             -H "Authorization: Bearer $OPENROUTER_API_KEY" \
             -H "Content-Type: application/json" \
             -d @request.json > response.json
@@ -119,8 +139,8 @@ jobs:
           # OpenRouter reports the cost in USD (credits)
           COST=$(jq -r '.usage | if .cost != null then "$\(.cost * 10000 | round / 10000) · \(.prompt_tokens) prompt + \(.completion_tokens) completion tokens" else "n/a" end' response.json 2>/dev/null || echo "n/a")
 
-          printf '%s sha=%s -->\n### 🤖 AI consistency review (`%s`)\n\n%s\n\n<sub>💰 Review cost: %s</sub>\n' \
-            "$REVIEW_MARKER" "$HEAD_SHA" "${USED_MODEL:-$MODEL}" "$REVIEW" "$COST" > comment.md
+          printf '%s sha=%s diff=%s -->\n### 🤖 AI consistency review (`%s`)\n\n%s\n\n<sub>💰 Review cost: %s</sub>\n' \
+            "$REVIEW_MARKER" "$HEAD_SHA" "$DIFF_HASH" "${USED_MODEL:-$MODEL}" "$REVIEW" "$COST" > comment.md
 
           # Post a new comment per review so the history and each run's cost stay visible
           gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" --body-file comment.md
@@ -136,22 +156,18 @@ jobs:
         if: steps.checkout.outcome == 'failure' || steps.diff.outcome == 'failure' || steps.review.outcome == 'failure'
         run: echo "::warning::AI review could not be completed, see the step logs above"
 
-  remind:
-    # Runs after each review and on review requests (when the review job is skipped).
-    # No model involved: open findings are extracted from the latest review.
-    needs: review
-    if: "${{ always() && needs.review.result != 'cancelled' && github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft }}"
-    runs-on: ubuntu-latest
-    concurrency:
-      group: ai-review-reminder-${{ github.event.pull_request.number }}
-    env:
-      PR_AUTHOR: ${{ github.event.pull_request.user.login }}
-    steps:
+      # Runs after each review and on review requests. No model involved: open findings
+      # are extracted from the latest review. Skipped when no reviewer was requested.
       - name: Ask author about open findings
+        if: join(github.event.pull_request.requested_reviewers.*.login, '') != '' || join(github.event.pull_request.requested_teams.*.slug, '') != ''
         continue-on-error: true
+        env:
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         run: |
           set -e
           REPO="${{ github.repository }}"
+          # Keep scratch files out of the checked-out repository
+          cd "$RUNNER_TEMP"
 
           # Use live PR state: the event payload may be outdated by the time this runs
           gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid,reviewRequests > pr.json
@@ -162,7 +178,7 @@ jobs:
             --jq ".[] | select(.body | startswith(\"$REVIEW_MARKER\") or startswith(\"$REMINDER_MARKER\")) | {node_id, body}" \
             | jq -s '.' > comments.json
 
-          # The review for this commit may still be running; its own remind job will follow up
+          # The review for this commit may still be running; its own reminder step will follow up
           jq -r --arg m "$REVIEW_MARKER sha=$HEAD_SHA " \
             '[.[] | select(.body | startswith($m))] | last.body // empty' comments.json > review.md
           [ -s review.md ] || { echo "No AI review for $HEAD_SHA yet, skipping"; exit 0; }
