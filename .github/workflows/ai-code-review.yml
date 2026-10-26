@@ -30,9 +30,7 @@ jobs:
       group: ai-review-${{ github.event.pull_request.number }}-${{ github.event.action == 'review_requested' && 'remind' || 'review' }}
       cancel-in-progress: ${{ github.event.action != 'review_requested' }}
     env:
-      # pareto-code picks the cheapest available coding model above MIN_CODING_SCORE (0-1)
-      MODEL: "openrouter/pareto-code"
-      MIN_CODING_SCORE: "0.4"
+      MODEL: "deepseek/deepseek-v4.1-flash-1017"
       MAX_DIFF_CHARS: 200000
     # The review is advisory: steps may fail, but the job always succeeds so it never blocks a merge.
     # A review request doesn't change the code, so it only runs the reminder.
@@ -103,7 +101,6 @@ jobs:
 
           jq -n \
             --arg model "$MODEL" \
-            --argjson minCodingScore "$MIN_CODING_SCORE" \
             --arg prompt "$PROMPT" \
             --arg title "$PR_TITLE" \
             --arg body "$PR_BODY" \
@@ -121,10 +118,7 @@ jobs:
                   + (if $previous != "" then "\n\nPrevious review:\n" + $previous else "" end)
                   + "\n\nDiff:\n```diff\n" + $diff + "\n```")}
               ]
-            }
-            + if $model == "openrouter/pareto-code"
-              then {plugins: [{id: "pareto-router", min_coding_score: $minCodingScore}]}
-              else {} end' > request.json
+            }' > request.json
 
           curl -sS --fail-with-body --max-time 300 https://openrouter.ai/api/v1/chat/completions \
             -H "Authorization: Bearer $OPENROUTER_API_KEY" \
