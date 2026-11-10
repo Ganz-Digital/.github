@@ -88,15 +88,6 @@ jobs:
           # Drop the marker and cost footer, keep the findings
           grep -v -e "^$REVIEW_MARKER" -e '^<sub>💰' previous.raw > previous.md || true
 
-          # Human comments may explain why a finding is intended, so the model shouldn't repeat it
-          {
-            gh api "repos/${{ github.repository }}/issues/$PR_NUMBER/comments" --paginate \
-              --jq ".[] | select(.body | startswith(\"$REVIEW_MARKER\") or startswith(\"$REMINDER_MARKER\") | not) | \"@\(.user.login): \(.body)\n\""
-            gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER/comments" --paginate \
-              --jq '.[] | "@\(.user.login) on \(.path):\(.line // .original_line): \(.body)\n"'
-          } > comments.raw || true
-          head -c 50000 comments.raw > comments.md || true
-
           PROMPT="Do a consistency check of this PR. Does it introduce code duplication? Does it use different names for the same things? Is it as simple as possible and reasonable? Does it create unnecessary boilerplate? Ignore translations. Make sure that there are no empty lines within functions (except React components and hooks, it's fine there.). Check if long functions have comments which sectionize the code and explain what happens in the function. Check if all new functions have a short description above them in multiline comment format. Short functions don't need the description if the function name is clear enough. Make sure that comments use simple words. No jargon."
           if [ -s previous.md ]; then
             PROMPT="$PROMPT
@@ -105,7 +96,7 @@ jobs:
           fi
           PROMPT="$PROMPT
 
-          Do not report an issue again if it is explained in a PR comment (included below) or in a code comment in the diff, and the explanation is reasonable. Mark such previous findings as addressed and add \"(explained)\"."
+          Do not report an issue again if it is explained in a code comment in the diff, and the explanation is reasonable. Mark such previous findings as addressed and add \"(explained)\"."
           # The reminder job extracts open findings by this format, so it must be strict
           PROMPT="$PROMPT
 
@@ -118,15 +109,12 @@ jobs:
             --arg body "$PR_BODY" \
             --rawfile diff pr.diff \
             --rawfile previous previous.md \
-            --rawfile comments comments.md \
             '{
               model: $model,
               messages: [
                 {role: "system", content: "You are a senior code reviewer. Answer concisely in Markdown. Reference files and lines from the diff. If there are no issues for a question, say so in one line."},
                 {role: "user", content: ($prompt + "\n\nPR title: " + $title + "\n\nPR description:\n" + $body
-                  + (if $previous != "" then "\n\nPrevious review:\n" + $previous else "" end)
-                  + (if $comments != "" then "\n\nPR comments:\n" + $comments else "" end)
-                  + "\n\nDiff:\n```diff\n" + $diff + "\n```")}
+                  + (if $previous != "" then "\n\nPrevious review:\n" + $previous else "" end)                  + "\n\nDiff:\n```diff\n" + $diff + "\n```")}
               ]
             }' > request.json
 
