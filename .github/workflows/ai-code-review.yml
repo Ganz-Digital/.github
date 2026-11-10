@@ -130,11 +130,17 @@ jobs:
               ]
             }' > request.json
 
-          # OpenCode Go subscription, OpenAI-compatible endpoint
-          curl -sS --fail-with-body --max-time 300 https://opencode.ai/zen/go/v1/chat/completions \
+          # OpenCode Go requires a session ID and a client-specific user agent.
+          # One session per PR, shaped like a UUID.
+          SESSION_ID=$(printf '%s#%s' "${{ github.repository }}" "$PR_NUMBER" | sha256sum \
+            | sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12}).*/\1-\2-\3-\4-\5/')
+          # Print the API's error message, which curl alone does not show
+          curl -sS --fail-with-body --max-time 300 https://opencode.ai/inference/go/openai/v1/chat/completions \
             -H "Authorization: Bearer $OPENCODE_API_KEY" \
             -H "Content-Type: application/json" \
-            -d @request.json > response.json
+            -H "User-Agent: ai-consistency-review/1.0" \
+            -H "x-opencode-session: $SESSION_ID" \
+            -d @request.json > response.json || { cat response.json; exit 1; }
 
           REVIEW=$(jq -r '.choices[0].message.content // empty' response.json)
           [ -n "$REVIEW" ] || { echo "No review returned:"; cat response.json; exit 1; }
