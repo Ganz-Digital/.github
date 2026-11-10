@@ -30,7 +30,7 @@ jobs:
       group: ai-review-${{ github.event.pull_request.number }}-${{ github.event.action == 'review_requested' && 'remind' || 'review' }}
       cancel-in-progress: ${{ github.event.action != 'review_requested' }}
     env:
-      MODEL: "deepseek/deepseek-v4.1-flash-1017"
+      MODEL: "deepseek-v4.1-flash"
       MAX_DIFF_CHARS: 200000
     # The review is advisory: steps may fail, but the job always succeeds so it never blocks a merge.
     # A review request doesn't change the code, so it only runs the reminder.
@@ -62,7 +62,7 @@ jobs:
         if: github.event.action != 'review_requested'
         continue-on-error: true
         env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
@@ -121,10 +121,6 @@ jobs:
             --rawfile comments comments.md \
             '{
               model: $model,
-              # Only route to providers that neither train on nor retain prompts
-              provider: {data_collection: "deny", zdr: true},
-              # Return token counts and cost in the response
-              usage: {include: true},
               messages: [
                 {role: "system", content: "You are a senior code reviewer. Answer concisely in Markdown. Reference files and lines from the diff. If there are no issues for a question, say so in one line."},
                 {role: "user", content: ($prompt + "\n\nPR title: " + $title + "\n\nPR description:\n" + $body
@@ -134,8 +130,9 @@ jobs:
               ]
             }' > request.json
 
-          curl -sS --fail-with-body --max-time 300 https://openrouter.ai/api/v1/chat/completions \
-            -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+          # OpenCode Go subscription, OpenAI-compatible endpoint
+          curl -sS --fail-with-body --max-time 300 https://opencode.ai/zen/go/v1/chat/completions \
+            -H "Authorization: Bearer $OPENCODE_API_KEY" \
             -H "Content-Type: application/json" \
             -d @request.json > response.json
 
@@ -144,11 +141,11 @@ jobs:
           # Routers resolve to a concrete model; show which one actually reviewed
           USED_MODEL=$(jq -r '.model // empty' response.json)
 
-          # OpenRouter reports the cost in USD (credits)
-          COST=$(jq -r '.usage | if .cost != null then "$\(.cost * 10000 | round / 10000) · \(.prompt_tokens) prompt + \(.completion_tokens) completion tokens" else "n/a" end' response.json 2>/dev/null || echo "n/a")
+          # The subscription has no per-request price, so show token usage instead
+          USAGE=$(jq -r '.usage | if . != null then "\(.prompt_tokens) prompt + \(.completion_tokens) completion tokens" else "n/a" end' response.json 2>/dev/null || echo "n/a")
 
-          printf '%s sha=%s diff=%s -->\n### 🤖 AI consistency review (`%s`)\n\n%s\n\n<sub>💰 Review cost: %s</sub>\n' \
-            "$REVIEW_MARKER" "$HEAD_SHA" "$DIFF_HASH" "${USED_MODEL:-$MODEL}" "$REVIEW" "$COST" > comment.md
+          printf '%s sha=%s diff=%s -->\n### 🤖 AI consistency review (`%s`)\n\n%s\n\n<sub>💰 Token usage: %s</sub>\n' \
+            "$REVIEW_MARKER" "$HEAD_SHA" "$DIFF_HASH" "${USED_MODEL:-$MODEL}" "$REVIEW" "$USAGE" > comment.md
 
           # Post a new comment per review so the history and each run's cost stay visible
           gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" --body-file comment.md
