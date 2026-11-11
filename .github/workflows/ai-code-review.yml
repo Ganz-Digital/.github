@@ -97,7 +97,7 @@ jobs:
           } > comments.raw || true
           head -c 50000 comments.raw > comments.md || true
 
-          PROMPT="Do a consistency check of this PR. Does it introduce code duplication? Does it use different names for the same things? Is it as simple as possible and reasonable? Does it create unnecessary boilerplate? Ignore translations. Make sure that there are no empty lines within functions (except React components and hooks, it's fine there.). Check if long functions have comments which sectionize the code and explain what happens in the function. Check if all new functions have a short description above them in multiline comment format. Short functions don't need the description if the function name is clear enough. Make sure that comments use simple words. No jargon."
+          PROMPT="Do a consistency check of this PR. Does it introduce code duplication? Does it use different names for the same things? Is it as simple as possible and reasonable? Does it create unnecessary boilerplate? Ignore translations. Make sure that there are no empty lines within functions (except React components and hooks, it's fine there.). Check if long functions have comments which sectionize the code and explain what happens in the function. Check if all new functions have a short description above them in multiline comment format. Short functions don't need the description if the function name is clear enough. Make sure that comments use simple words. No jargon. Don't be overly nitpicky, but point out real issues."
           if [ -s previous.md ]; then
             PROMPT="$PROMPT
 
